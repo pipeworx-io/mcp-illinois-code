@@ -25,139 +25,201 @@ interface McpToolExport {
 }
 
 /**
- * HTML-to-text helpers shared by the state statute packs.
+ * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
- * One decoder rather than one per pack, because the copies had already begun
- * to drift: the hex-entity case (&#x2003; em space, &#x2014; em dash) was
- * handled in Florida's copy and not California's, so Californian statutes were
- * quietly emitting raw entities where punctuation belonged. Fixed once here.
+ * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
+ * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
+ * covered the majority and structurally could not cover the rest: the rest
+ * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
+ * the 24h to 2026-09-02T15:00Z (fleet #1096):
  *
- * publish-pack.sh inlines workspace imports, so a standalone pack still ships
- * self-contained.
+ *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
+ *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
+ *
+ * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
+ * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
+ * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
+ * our own Supabase for fleet. There is no third party anywhere in either call.
+ * Same defect as #1089: our own outage filed under `upstream_down`, the one
+ * class that means "the source is unreachable and there is nothing for us to
+ * fix", which is why the problem-tools triage skips it.
+ *
+ * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
+ * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
+ * one site today, so it would work today. It would also rot the first time
+ * somebody rewords a label — silently, and in the direction of hiding our own
+ * outage, which is worse than the bug being fixed. Every prose rule in
+ * error-class.ts has needed widening as packs invented new wording (#409/#450/
+ * #584); that history is most of that file's comment budget.
+ *
+ * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
+ * hostname is a fact about the call, not a guess about its prose. Two
+ * consequences that a pack-level flag could not give us, and the reason the
+ * flag was rejected:
+ *
+ *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
+ *     Supabase AND to genuine third parties; `court-listener` holds our cache
+ *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
+ *     either pack would relabel a real third-party outage as ours — inventing
+ *     work, which is the same class of error in the opposite direction.
+ *   - It covers every future internal pack for free, instead of one declared
+ *     slug at a time.
+ *
+ * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
+ * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
+ * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
+ * this module — so changing the wording changes both sides in the same edit and
+ * cannot desynchronise them. The pack's own label (`fleet db error:`,
+ * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
+ * unaffected. That is the property `stripClassPrefix` lacked when it drifted
+ * from its own classifier three times and needed a CI gate to hold them
+ * together.
+ *
+ * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
+ * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
+ * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
+ * availability failure" is decided from the actual status code, never re-derived
+ * by scraping a number out of a sentence. A 404 from our own registry for a slug
+ * that does not exist is a caller's bad argument and is deliberately NOT marked.
  */
-
-const SCRIPT = /<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi;
-const BLOCK = /<\/?(p|div|br|tr|li|h[1-6]|blockquote)\b[^>]*>/gi;
-
-/** Convert a slice of statute HTML to readable plain text. */
-function statuteText(html: string): string {
-  return html
-    .replace(/\r\n?/g, '\n')
-    .replace(SCRIPT, ' ')
-    .replace(BLOCK, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    // Hex before decimal: legislature sites emit &#x2003; and &#x2014;
-    // constantly, and a decimal-only decoder leaves them in the middle of the
-    // statute looking like markup noise.
-    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
-    .replace(/&sect;/g, '\u00a7')
-    // Named entities that carry MEANING, decoded before the catch-all below.
-    // This was a real defect: the catch-all replaced &ndash; with a SPACE, so
-    // Maryland's "&sect;2&ndash;201." decoded to "2 201" and a lookup for
-    // section 2-201 reported a statute that plainly exists as missing. Dashes
-    // are everywhere in statutory text and numbering, so the corruption was
-    // silent and general rather than particular to one state.
-    .replace(/&ndash;/g, '\u2013')
-    .replace(/&mdash;/g, '\u2014')
-    .replace(/&rsquo;|&apos;/g, '\u2019')
-    .replace(/&lsquo;/g, '\u2018')
-    .replace(/&ldquo;/g, '\u201c')
-    .replace(/&rdquo;/g, '\u201d')
-    .replace(/&hellip;/g, '\u2026')
-    .replace(/&[a-z]+;/gi, ' ')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/ *\n */g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
 
 /**
- * Text from a container, starting AFTER its opening tag.
+ * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
  *
- * Slicing at the marker itself leaves the tail of the tag — `laws-body">` — as
- * the first characters of the statute, which is exactly what three packs did
- * before testing caught it.
+ * ONE value, not three, unlike `internal_db_*`. That split existed because a
+ * slow query, an exhausted pool and an unknown SQLSTATE have different owners
+ * and different fixes. Here there is only one story to tell — an origin we run
+ * did not answer the edge — and one owner. A bucket with no distinct owner per
+ * value is decoration; #724 is what happens when a class holds several
+ * situations, and inventing sub-values ahead of a reason to act on them
+ * differently is the same mistake with the sign flipped.
+ *
+ * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
+ * values. `classifyToolError` still answers `upstream_down` for the retry and
+ * hint paths, which only care whether retrying or a sibling tool might work —
+ * and it might. Nothing a caller sees or is charged changes here.
+ *
+ * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
+ * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
+ * lands on no dashboard — fleet #721 is the warning, where the #719 split
+ * worked on the write side and was invisible for weeks.
  */
-function textFromContainer(html: string, marker: string | RegExp): string | null {
-  const i = typeof marker === 'string' ? html.indexOf(marker) : html.search(marker);
-  if (i === -1) return null;
-  const gt = html.indexOf('>', i);
-  return statuteText(html.slice(gt === -1 ? i : gt + 1));
-}
+const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
 
 /**
- * Read a statute response as text, honouring its actual encoding.
+ * The token that carries "this origin is ours" from the call site to the
+ * classifier.
  *
- * Several state sites serve WINDOWS-1252 while sending `content-type:
- * text/html` with no charset. Response.text() assumes UTF-8, so their smart
- * quotes and non-breaking spaces decode to replacement characters — Nevada
- * rendered `"Murder" defined` as mojibake, and Oregon's section headings
- * became unmatchable because the "space" after the section number is a 0xA0
- * that never survived the decode.
+ * Appended to the error message rather than attached to the Error object,
+ * because the object does not survive the trip: 275 packs return `{ error:
+ * string }` instead of throwing, the gateway reads `observedError` as a string,
+ * and the fleet pack rebuilds its error from a captured status + body across a
+ * retry loop. A property on an Error would be dropped by every one of those
+ * paths and the class would work in tests and vanish in production.
  *
- * That is the quiet kind of damage: the text still looks like text, so nothing
- * errors, and a heading regex simply stops matching for reasons no one can see
- * in the output.
- *
- * Strict UTF-8 first — if the bytes really are UTF-8 this succeeds and nothing
- * changes — then fall back to windows-1252, which decodes every byte and so
- * cannot itself fail.
+ * WORDING IS LOAD-BEARING, same rule as labelAge's note in authority.ts. This
+ * string is appended to a pack's thrown Error message (shared/src/http.ts),
+ * and a thrown Error's message is exactly what the gateway hands back to the
+ * caller as `content[0].text` when nothing rewrites it (workers/gateway/src
+ * catches the throw and sets `rawResult.message = stripClassPrefix(error)`,
+ * which does not touch this suffix) — so the original wording,
+ * " [pipeworx-hosted origin — our own service, not a third party]", was not a
+ * theoretical leak: it shipped live on pipeworx-catalog's 522s, 7 times in 6
+ * hours on 2026-09-02 (see tests/golden-internal-service.test.ts), verbatim
+ * naming Pipeworx as the host. check:hosting-claims never caught it because it
+ * did not scan shared/ at all (task #2009). Reworded to describe the
+ * OBSERVATION (the origin did not answer) without a claim about who runs it —
+ * the identical fix labelAge got: drop the possessive, keep the fact.
  */
-async function readStatuteResponse(res: Response): Promise<string> {
-  const buf = await res.arrayBuffer();
+const INTERNAL_ORIGIN_MARKER = ' [origin did not respond — retry before concluding the named source is down]';
+
+/**
+ * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
+ * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
+ *
+ * Matching the shape rather than listing the ref keeps this correct when we add
+ * a project — `supabaseEnv` on a pack entry already points some packs at a
+ * second one — while still excluding `status.supabase.co`, which is Supabase's
+ * own status page and emphatically not our database. Verified 2026-09-02 by
+ * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
+ * only real project ref anywhere in the tree is ours, the rest are doc
+ * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
+ * finding internal-db-class.ts relies on for the PostgREST envelope being ours
+ * by construction.
+ */
+const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
+
+/**
+ * Is this a host WE run?
+ *
+ * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
+ * hosted on workers.dev, so the suffix says where something runs and not who
+ * owns it. Every internal call we actually make goes to a `pipeworx.io`
+ * hostname or to our Supabase project, both of which are ownership facts.
+ *
+ * `workers/gateway/src/provenance.ts`'s `OUR_HOSTS` answers the same
+ * question and DOES include `workers.dev` — a documented divergence
+ * (task #2051), not a bug to converge. That list decides what a response may
+ * cite as a data SOURCE, where a false negative (citing our own worker as an
+ * external source) is the hosting-disclosure leak this whole file exists to
+ * prevent, so it errs broad. This one decides who gets BLAMED for a 5xx in
+ * outage metrics read by on-call, where a false positive (crediting our own
+ * infra with a third party's outage) hides the real failure, so it errs
+ * narrow. Same suffix, opposite direction, because they are never called for
+ * the same reason.
+ *
+ * Returns false on anything unparseable rather than throwing — this runs inside
+ * an error path, and an error path that can itself throw turns a diagnosable
+ * failure into a mystery.
+ */
+function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
+  if (!url) return false;
+  let host: string;
   try {
-    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(buf);
+    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
   } catch {
-    return new TextDecoder('windows-1252').decode(buf);
+    return false;
   }
+  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
+  return SUPABASE_PROJECT_HOST.test(host);
 }
 
 /**
- * Cut one section out of a page that holds a whole chapter.
+ * Append the marker when this failure was OUR origin failing to answer.
  *
- * A section number appears several times on these pages and only one of them
- * starts the statute. The others are a table-of-contents entry at the top and
- * cross-references inside neighbouring sections. Picking the FIRST match
- * returns a heading with nothing under it; picking the LAST returns whatever
- * fragment follows a cross-reference. Both were tried and both produced
- * confident, tiny, wrong answers — Oregon 140 characters, Nevada 39, each
- * looking like a real result.
+ * `status` is the HTTP status when there is one, and omitted for a timeout —
+ * where there is no response at all, and "the origin did not answer" is the
+ * whole observation. Statuses below 500 are left alone: a 404 from our own
+ * registry for a slug that does not exist is the caller's argument, not our
+ * outage, and marking it would put ordinary 404s on the incident dashboard.
  *
- * The body is simply the candidate with the most text before the next section
- * begins, which is true regardless of where the page puts its contents list.
- *
- * @param heading matches the start of the wanted section (global flag required)
- * @param next    matches the start of ANY section, to bound the slice
+ * Idempotent, so a message that is wrapped and re-marked on the way up (the
+ * fleet pack's retry loop re-throws through two layers) carries the marker once.
  */
-function sliceSection(text: string, heading: RegExp, next: RegExp): string | null {
-  // Record where each candidate starts AND how long its heading is. Skipping
-  // only one character past the start lets the  pattern re-match the very
-  // heading we just found, which yields an empty body — that bug returned
-  // section_not_found for a section plainly present on the page.
-  const found: Array<{ at: number; len: number }> = [];
-  const re = new RegExp(heading.source, heading.flags.includes('g') ? heading.flags : heading.flags + 'g');
-  for (let m = re.exec(text); m; m = re.exec(text)) {
-    found.push({ at: m.index, len: m[0].length });
-    if (re.lastIndex === m.index) re.lastIndex++;   // guard zero-width matches
-  }
-  if (!found.length) return null;
-
-  let best: string | null = null;
-  for (const { at, len } of found) {
-    const from = at + len;
-    const nre = new RegExp(next.source, next.flags.includes('g') ? next.flags : next.flags + 'g');
-    const m = nre.exec(text.slice(from));
-    const body = (m ? text.slice(at, from + m.index) : text.slice(at)).trim();
-    if (body.length > (best?.length ?? 0)) best = body;
-  }
-  return best && best.length > 0 ? best : null;
+function markInternalOrigin(
+  message: string,
+  url: string | URL | undefined | null,
+  status?: number,
+): string {
+  if (status !== undefined && status < 500) return message;
+  if (!isPipeworxOrigin(url)) return message;
+  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
+  return message + INTERNAL_ORIGIN_MARKER;
 }
+
+/**
+ * Which blob4 value a failure from our own web services books as, or undefined
+ * if this is not one.
+ *
+ * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
+ * from our own Supabase is a strictly more specific statement about the same
+ * row (which of our services, and why), and the two cannot disagree about
+ * whether the failure is ours.
+ */
+function internalHostMetricsClass(error: string): string | undefined {
+  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
+}
+
 
 /**
  * One place to turn a failed `fetch` into an error a caller can act on.
@@ -574,181 +636,140 @@ function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 
-/**
- * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
- *
- * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
- * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
- * covered the majority and structurally could not cover the rest: the rest
- * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
- * the 24h to 2026-09-02T15:00Z (fleet #1096):
- *
- *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
- *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
- *
- * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
- * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
- * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
- * our own Supabase for fleet. There is no third party anywhere in either call.
- * Same defect as #1089: our own outage filed under `upstream_down`, the one
- * class that means "the source is unreachable and there is nothing for us to
- * fix", which is why the problem-tools triage skips it.
- *
- * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
- * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
- * one site today, so it would work today. It would also rot the first time
- * somebody rewords a label — silently, and in the direction of hiding our own
- * outage, which is worse than the bug being fixed. Every prose rule in
- * error-class.ts has needed widening as packs invented new wording (#409/#450/
- * #584); that history is most of that file's comment budget.
- *
- * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
- * hostname is a fact about the call, not a guess about its prose. Two
- * consequences that a pack-level flag could not give us, and the reason the
- * flag was rejected:
- *
- *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
- *     Supabase AND to genuine third parties; `court-listener` holds our cache
- *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
- *     either pack would relabel a real third-party outage as ours — inventing
- *     work, which is the same class of error in the opposite direction.
- *   - It covers every future internal pack for free, instead of one declared
- *     slug at a time.
- *
- * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
- * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
- * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
- * this module — so changing the wording changes both sides in the same edit and
- * cannot desynchronise them. The pack's own label (`fleet db error:`,
- * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
- * unaffected. That is the property `stripClassPrefix` lacked when it drifted
- * from its own classifier three times and needed a CI gate to hold them
- * together.
- *
- * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
- * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
- * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
- * availability failure" is decided from the actual status code, never re-derived
- * by scraping a number out of a sentence. A 404 from our own registry for a slug
- * that does not exist is a caller's bad argument and is deliberately NOT marked.
- */
 
 /**
- * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
+ * HTML-to-text helpers shared by the state statute packs.
  *
- * ONE value, not three, unlike `internal_db_*`. That split existed because a
- * slow query, an exhausted pool and an unknown SQLSTATE have different owners
- * and different fixes. Here there is only one story to tell — an origin we run
- * did not answer the edge — and one owner. A bucket with no distinct owner per
- * value is decoration; #724 is what happens when a class holds several
- * situations, and inventing sub-values ahead of a reason to act on them
- * differently is the same mistake with the sign flipped.
+ * One decoder rather than one per pack, because the copies had already begun
+ * to drift: the hex-entity case (&#x2003; em space, &#x2014; em dash) was
+ * handled in Florida's copy and not California's, so Californian statutes were
+ * quietly emitting raw entities where punctuation belonged. Fixed once here.
  *
- * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
- * values. `classifyToolError` still answers `upstream_down` for the retry and
- * hint paths, which only care whether retrying or a sibling tool might work —
- * and it might. Nothing a caller sees or is charged changes here.
- *
- * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
- * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
- * lands on no dashboard — fleet #721 is the warning, where the #719 split
- * worked on the write side and was invisible for weeks.
+ * publish-pack.sh inlines workspace imports, so a standalone pack still ships
+ * self-contained.
  */
-const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
+
+const SCRIPT = /<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi;
+const BLOCK = /<\/?(p|div|br|tr|li|h[1-6]|blockquote)\b[^>]*>/gi;
+
+/** Convert a slice of statute HTML to readable plain text. */
+function statuteText(html: string): string {
+  return html
+    .replace(/\r\n?/g, '\n')
+    .replace(SCRIPT, ' ')
+    .replace(BLOCK, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    // Hex before decimal: legislature sites emit &#x2003; and &#x2014;
+    // constantly, and a decimal-only decoder leaves them in the middle of the
+    // statute looking like markup noise.
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
+    .replace(/&sect;/g, '\u00a7')
+    // Named entities that carry MEANING, decoded before the catch-all below.
+    // This was a real defect: the catch-all replaced &ndash; with a SPACE, so
+    // Maryland's "&sect;2&ndash;201." decoded to "2 201" and a lookup for
+    // section 2-201 reported a statute that plainly exists as missing. Dashes
+    // are everywhere in statutory text and numbering, so the corruption was
+    // silent and general rather than particular to one state.
+    .replace(/&ndash;/g, '\u2013')
+    .replace(/&mdash;/g, '\u2014')
+    .replace(/&rsquo;|&apos;/g, '\u2019')
+    .replace(/&lsquo;/g, '\u2018')
+    .replace(/&ldquo;/g, '\u201c')
+    .replace(/&rdquo;/g, '\u201d')
+    .replace(/&hellip;/g, '\u2026')
+    .replace(/&[a-z]+;/gi, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
 
 /**
- * The token that carries "this origin is ours" from the call site to the
- * classifier.
+ * Text from a container, starting AFTER its opening tag.
  *
- * Appended to the error message rather than attached to the Error object,
- * because the object does not survive the trip: 275 packs return `{ error:
- * string }` instead of throwing, the gateway reads `observedError` as a string,
- * and the fleet pack rebuilds its error from a captured status + body across a
- * retry loop. A property on an Error would be dropped by every one of those
- * paths and the class would work in tests and vanish in production.
- *
- * Written as a sentence rather than a sigil because it is going to be read by
- * whoever gets the error, and "our own service, not a third party" is the
- * single most useful thing to tell them — fetchWithTimeout's own comment
- * (fleet #1047) is about exactly this ambiguity, where blaming a healthy vendor
- * by name sent the next person waiting for an outage that did not exist.
+ * Slicing at the marker itself leaves the tail of the tag — `laws-body">` — as
+ * the first characters of the statute, which is exactly what three packs did
+ * before testing caught it.
  */
-const INTERNAL_ORIGIN_MARKER = ' [pipeworx-hosted origin — our own service, not a third party]';
+function textFromContainer(html: string, marker: string | RegExp): string | null {
+  const i = typeof marker === 'string' ? html.indexOf(marker) : html.search(marker);
+  if (i === -1) return null;
+  const gt = html.indexOf('>', i);
+  return statuteText(html.slice(gt === -1 ? i : gt + 1));
+}
 
 /**
- * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
- * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
+ * Read a statute response as text, honouring its actual encoding.
  *
- * Matching the shape rather than listing the ref keeps this correct when we add
- * a project — `supabaseEnv` on a pack entry already points some packs at a
- * second one — while still excluding `status.supabase.co`, which is Supabase's
- * own status page and emphatically not our database. Verified 2026-09-02 by
- * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
- * only real project ref anywhere in the tree is ours, the rest are doc
- * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
- * finding internal-db-class.ts relies on for the PostgREST envelope being ours
- * by construction.
+ * Several state sites serve WINDOWS-1252 while sending `content-type:
+ * text/html` with no charset. Response.text() assumes UTF-8, so their smart
+ * quotes and non-breaking spaces decode to replacement characters — Nevada
+ * rendered `"Murder" defined` as mojibake, and Oregon's section headings
+ * became unmatchable because the "space" after the section number is a 0xA0
+ * that never survived the decode.
+ *
+ * That is the quiet kind of damage: the text still looks like text, so nothing
+ * errors, and a heading regex simply stops matching for reasons no one can see
+ * in the output.
+ *
+ * Strict UTF-8 first — if the bytes really are UTF-8 this succeeds and nothing
+ * changes — then fall back to windows-1252, which decodes every byte and so
+ * cannot itself fail.
  */
-const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
-
-/**
- * Is this a host WE run?
- *
- * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
- * hosted on workers.dev, so the suffix says where something runs and not who
- * owns it. Every internal call we actually make goes to a `pipeworx.io`
- * hostname or to our Supabase project, both of which are ownership facts.
- *
- * Returns false on anything unparseable rather than throwing — this runs inside
- * an error path, and an error path that can itself throw turns a diagnosable
- * failure into a mystery.
- */
-function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
-  if (!url) return false;
-  let host: string;
+async function readStatuteResponse(res: Response): Promise<string> {
+  const buf = await res.arrayBuffer();
   try {
-    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(buf);
   } catch {
-    return false;
+    return new TextDecoder('windows-1252').decode(buf);
   }
-  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
-  return SUPABASE_PROJECT_HOST.test(host);
 }
 
 /**
- * Append the marker when this failure was OUR origin failing to answer.
+ * Cut one section out of a page that holds a whole chapter.
  *
- * `status` is the HTTP status when there is one, and omitted for a timeout —
- * where there is no response at all, and "the origin did not answer" is the
- * whole observation. Statuses below 500 are left alone: a 404 from our own
- * registry for a slug that does not exist is the caller's argument, not our
- * outage, and marking it would put ordinary 404s on the incident dashboard.
+ * A section number appears several times on these pages and only one of them
+ * starts the statute. The others are a table-of-contents entry at the top and
+ * cross-references inside neighbouring sections. Picking the FIRST match
+ * returns a heading with nothing under it; picking the LAST returns whatever
+ * fragment follows a cross-reference. Both were tried and both produced
+ * confident, tiny, wrong answers — Oregon 140 characters, Nevada 39, each
+ * looking like a real result.
  *
- * Idempotent, so a message that is wrapped and re-marked on the way up (the
- * fleet pack's retry loop re-throws through two layers) carries the marker once.
+ * The body is simply the candidate with the most text before the next section
+ * begins, which is true regardless of where the page puts its contents list.
+ *
+ * @param heading matches the start of the wanted section (global flag required)
+ * @param next    matches the start of ANY section, to bound the slice
  */
-function markInternalOrigin(
-  message: string,
-  url: string | URL | undefined | null,
-  status?: number,
-): string {
-  if (status !== undefined && status < 500) return message;
-  if (!isPipeworxOrigin(url)) return message;
-  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
-  return message + INTERNAL_ORIGIN_MARKER;
-}
+function sliceSection(text: string, heading: RegExp, next: RegExp): string | null {
+  // Record where each candidate starts AND how long its heading is. Skipping
+  // only one character past the start lets the  pattern re-match the very
+  // heading we just found, which yields an empty body — that bug returned
+  // section_not_found for a section plainly present on the page.
+  const found: Array<{ at: number; len: number }> = [];
+  const re = new RegExp(heading.source, heading.flags.includes('g') ? heading.flags : heading.flags + 'g');
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    found.push({ at: m.index, len: m[0].length });
+    if (re.lastIndex === m.index) re.lastIndex++;   // guard zero-width matches
+  }
+  if (!found.length) return null;
 
-/**
- * Which blob4 value a failure from our own web services books as, or undefined
- * if this is not one.
- *
- * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
- * from our own Supabase is a strictly more specific statement about the same
- * row (which of our services, and why), and the two cannot disagree about
- * whether the failure is ours.
- */
-function internalHostMetricsClass(error: string): string | undefined {
-  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
+  let best: string | null = null;
+  for (const { at, len } of found) {
+    const from = at + len;
+    const nre = new RegExp(next.source, next.flags.includes('g') ? next.flags : next.flags + 'g');
+    const m = nre.exec(text.slice(from));
+    const body = (m ? text.slice(at, from + m.index) : text.slice(at)).trim();
+    if (body.length > (best?.length ?? 0)) best = body;
+  }
+  return best && best.length > 0 ? best : null;
 }
 /**
  * Illinois Compiled Statutes — state statutes by citation.
