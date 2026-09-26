@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-illinois-code",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Illinois Compiled Statutes — state statutes by citation.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-5074e28d8b9c605bb5421d244a713cbf18fb53ba6edd3992514269b86cb58eaf",
-    "sourceCommit": "70cd53748fc9f9a43ed3681d751bfa96e701efd2"
+    "sourceHash": "v1-ee6c49249056e1cb41a55945f7b6bfd00fa6a2ecf0c1b16a19a89079604c7f69",
+    "sourceCommit": "1064560fd9dcd0d6fc2606298c2ba244b3a1fbeb"
   }
 }
