@@ -807,84 +807,186 @@ function sliceSection(text: string, heading: RegExp, next: RegExp): string | nul
   return best && best.length > 0 ? best : null;
 }
 /**
- * Illinois Compiled Statutes — state statutes by citation.
+ * Illinois Compiled Statutes — state statutes by citation, plus topic search.
  *
- * Rejected twice before this worked, for a reason worth recording: I was
- * probing the OLD path (/legislation/ilcs/fulltext.asp), which now 404s
- * because the site was restructured, and testing with a needle that does not
- * appear in the statute. Two independent mistakes producing the same "no",
- * which read as "Illinois is unreachable" rather than "you asked wrong".
+ * PRE-FETCHED TEXT FIRST (fleet #2505). The live site is unreachable from a Worker:
+ * ilga.gov serves an incomplete TLS certificate chain (its own leaf cert with
+ * no intermediate), so `curl` on a machine whose OS trust store already holds
+ * the missing Sectigo intermediate succeeds while `fetch()` — Cloudflare's or
+ * Node's own, both strict — fails outright (measured HTTP 526 at the gateway,
+ * `fetch failed` from plain Node). No retry fixes a cert chain; upstream_down
+ * every day for 14 straight days before this shipped.
  *
- * The current path still honours the derivable DocName encoding:
+ * ILGA's own "Access Denied" page for automated traffic points at exactly the
+ * fix: a public, nightly-synced file repository at ftp.ilga.gov meant for bulk
+ * consumption ("Automated systems should retrieve files from the repository
+ * rather than scraping ILGA.gov"). scripts/ingest-il-statutes.mjs walks it
+ * offline (outside Workers, where `curl` still works) and writes one JSON
+ * bundle per CHAPTER (68 objects, not 72,000 — one per act or per section
+ * would cost the same per-write with no benefit) into the DATASETS R2 bucket
+ * at `statutes/il/<chapter>.json`, keyed by the SAME zero-padded chapter the
+ * citation encoding already produces, so a citation lookup needs no index at
+ * all — just the chapter bundle, then a lookup of `act` then `section`
+ * within it.
  *
- *   720 ILCS 5/9-1  ->  /Legislation/ILCS/FullText?DocName=072000050K9-1
- *                                                          ^^^^ chapter
- *                                                              ^^^^ act
- *                                                                  ^ 0
- *                                                                   ^K + section
+ * A citation lookup tries the local bundle first (fast, immune to ilga.gov's
+ * cert and any future throttling) and falls back to the live fetch only if
+ * the bundle is missing or the section is not in it — belt-and-suspenders for
+ * anything ingested after this shipped but not yet re-crawled.
  *
- * Chapter and act are zero-padded to four; everything is recoverable from the
- * citation, so no ChapterID/ActID lookup hop is needed even though the site's
- * own navigation uses them.
+ * SEARCH is new: FTS5 in a SQLite Durable Object (workers/gateway/src/
+ * search-shard.ts), reusing the SEARCH_SHARD binding under shard name
+ * "il-statutes" — no new Cloudflare binding, which matters because the gateway
+ * sits at its text-binding ceiling (docs/gateway-text-binding-limit.md). Hit
+ * ids resolve back to citations via `statutes/il/_index.json`, a single small
+ * R2 object built by the same loader.
  *
- * SILENT FAILURE: an unknown section returns HTTP 200 with a shorter page and
- * no statute. The discriminator is the presence of a "Sec. <n>." heading.
+ * The encoding is still derivable, unchanged from the original pack:
+ *
+ *   720 ILCS 5/9-1  ->  DocName=072000050K9-1
+ *                                ^^^^chapter ^^^^act 0 K+section
  */
 
-// Bound every fetch() in this pack to a fixed timeout — an upstream that
-// degrades without erroring would otherwise hold the Worker in `await fetch()`
-// until its own execution budget kills the request (minutes, not seconds).
-// Mirrors the epoFetch / usaspending retryFetch pattern (fleet #685).
 async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response> {
   return fetchWithTimeout(url, init ?? {}, 'Illinois Compiled Statutes');
 }
 
 const BASE = 'https://www.ilga.gov/Legislation/ILCS/FullText?DocName=';
 const UA = 'pipeworx-mcp-illinois-code/1.0 (+https://pipeworx.io)';
+const R2_PREFIX = 'statutes/il';
 
-const tools: McpToolExport['tools'] = [{
-  name: 'il_compiled_statute',
-  description:
-    'Get the FULL TEXT of a section of the Illinois Compiled Statutes — Illinois state law — by citation. "720 ILCS 5/9-1" is first degree murder; "625 ILCS 5/11-501" is DUI. Returns the statutory text. Keyless. Use for "what does 720 ILCS 5/9-1 say" or to check an Illinois statute a case relies on.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      chapter: { type: 'string', description: 'ILCS chapter, e.g. "720" (criminal offenses), "625" (vehicles), "750" (families).' },
-      act: { type: 'string', description: 'Act number within the chapter — the part after ILCS and before the slash, e.g. "5".' },
-      section: { type: 'string', description: 'Section as cited, e.g. "9-1" or "11-501".' },
-    },
-    required: ['chapter', 'act', 'section'],
-  },
-}];
+interface R2Like {
+  get(key: string): Promise<{ text(): Promise<string> } | null>;
+}
 
-async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
-  if (name !== 'il_compiled_statute') throw new Error(`Unknown tool: ${name}`);
-  const chapter = String(args.chapter ?? '').trim().replace(/[^0-9]/g, '');
-  const act = String(args.act ?? '').trim().replace(/[^0-9]/g, '');
-  const section = String(args.section ?? '').trim().replace(/\s+/g, '');
-  if (!chapter || !act || !section) {
-    return { found: false, reason: 'missing_argument',
-      message: 'chapter, act and section are all required — "720 ILCS 5/9-1" is chapter 720, act 5, section 9-1.',
-      hint: 'The citation reads <chapter> ILCS <act>/<section>.' };
+interface LocalSection {
+  section: string;
+  doc_name: string;
+  heading: string | null;
+  text: string;
+  url: string;
+}
+
+interface LocalActBundle {
+  act: string;
+  sections: LocalSection[];
+}
+
+interface LocalBundle {
+  chapter: string;
+  acts: LocalActBundle[];
+  ingested_at: string;
+  source: string;
+}
+
+interface IndexEntry {
+  id: number;
+  chapter: string;
+  act: string;
+  section: string;
+  doc_name: string;
+  heading: string | null;
+  text_chars: number;
+}
+
+interface StatuteIndex {
+  jurisdiction: string;
+  ingested_at: string;
+  entries: IndexEntry[];
+}
+
+function r2FromArgs(args: Record<string, unknown>): R2Like | undefined {
+  return args._r2 as R2Like | undefined;
+}
+
+async function readJson<T>(r2: R2Like, key: string): Promise<T | null> {
+  try {
+    const obj = await r2.get(key);
+    if (!obj) return null;
+    return JSON.parse(await obj.text()) as T;
+  } catch {
+    // A malformed or half-written object should degrade to "not found",
+    // never throw — a caller asking for a citation deserves a live fallback,
+    // not a 500 caused by a half-written entry.
+    return null;
   }
+}
 
+const tools: McpToolExport['tools'] = [
+  {
+    name: 'il_compiled_statute',
+    description:
+      'Get the FULL TEXT of a section of the Illinois Compiled Statutes — Illinois state law — by citation. "720 ILCS 5/9-1" is first degree murder; "625 ILCS 5/11-501" is DUI. Returns the statutory text with a data_as_of timestamp. Keyless. Use for "what does 720 ILCS 5/9-1 say" or to check an Illinois statute a case relies on.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chapter: { type: 'string', description: 'ILCS chapter, e.g. "720" (criminal offenses), "625" (vehicles), "750" (families).' },
+        act: { type: 'string', description: 'Act number within the chapter — the part after ILCS and before the slash, e.g. "5".' },
+        section: { type: 'string', description: 'Section as cited, e.g. "9-1" or "11-501".' },
+      },
+      required: ['chapter', 'act', 'section'],
+    },
+  },
+  {
+    name: 'il_statute_search',
+    description:
+      'Search Illinois Compiled Statutes BY TOPIC or keyword rather than citation — "currency exchange license fee", "concealed carry reciprocity", "landlord retaliation". Returns ranked sections with their citations; use il_compiled_statute afterward for the full text of one. Full-text search, so it answers questions no citation lookup can. Keyless.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Topic or keywords, e.g. "currency exchange license fee".' },
+        limit: { type: 'number', description: 'Max results, default 10, max 25.' },
+      },
+      required: ['query'],
+    },
+  },
+];
+
+/**
+ * Three outcomes, not two: the chapter bundle may not exist yet (nothing
+ * crawled — try live), it may exist but not carry this act (same), or it may
+ * carry the act but not the section — and THAT case is authoritative, not a
+ * reason to fall back. If the crawl reached this act at all, "no such
+ * section" is a fact about Illinois law, not a gap in what has been pre-fetched, and retrying
+ * against ilga.gov would just reproduce the same HTTP 526 for no benefit.
+ */
+async function localLookup(
+  r2: R2Like, chapter: string, act: string, section: string,
+): Promise<{ record: Record<string, unknown> } | { actKnown: true } | { actKnown: false }> {
+  const bundle = await readJson<LocalBundle>(r2, `${R2_PREFIX}/${chapter}.json`);
+  const actBundle = bundle?.acts.find((a) => a.act === act);
+  if (!actBundle) return { actKnown: false };
+  const hit = actBundle.sections.find((s) => s.section === section);
+  if (!hit) return { actKnown: true };
+  return {
+    record: {
+      citation: `${chapter} ILCS ${act}/${section}`,
+      chapter, act, section,
+      heading: hit.heading,
+      text: hit.text, text_chars: hit.text.length,
+      url: hit.url,
+      source: 'pre-fetched text (ftp.ilga.gov public file repository), keyless',
+      attribution: 'Illinois statutes are public record.',
+      data_as_of: bundle!.ingested_at,
+    },
+  };
+}
+
+async function liveLookup(chapter: string, act: string, section: string) {
   const docName = `${chapter.padStart(4, '0')}${act.padStart(4, '0')}0K${section}`;
   const url = `${BASE}${encodeURIComponent(docName)}`;
   const res = await pwFetch(url, { headers: { 'User-Agent': UA } });
   if (!res.ok) throw new Error(`Illinois General Assembly returned HTTP ${res.status} for ${chapter} ILCS ${act}/${section}`);
   const text = statuteText(await res.text());
 
-  // An unknown section still returns 200 — the tell is that no "Sec. <n>."
-  // heading is rendered, so the page is navigation with nothing under it.
   const esc = section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const at = text.search(new RegExp(`Sec\\.\\s*${esc}\\.`));
   if (at === -1) {
     return { found: false, reason: 'section_not_found', chapter, act, section,
       message: `No section ${section} in ${chapter} ILCS ${act}. The site returns a page for unknown citations, so this is read from the content rather than the status code.`,
-      hint: 'Check the act number — it is the part between ILCS and the slash. Section numbers are not contiguous.' };
+      hint: 'Check the act number — it is the part between ILCS and the slash. Section numbers are not contiguous.',
+      data_as_of: new Date().toISOString() };
   }
-
-  // Sections end where the next one begins; the page can carry several.
   const rest = text.slice(at + 4);
   const nextRel = rest.search(/Sec\.\s*[\d.\-A-Za-z]+\.\s/);
   const body = (nextRel === -1 ? text.slice(at) : text.slice(at, at + 4 + nextRel)).trim();
@@ -895,8 +997,119 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     chapter, act, section,
     heading: heading ? heading.trim() : null,
     text: body, text_chars: body.length, url,
-    source: 'Illinois General Assembly (ilga.gov), keyless',
+    source: 'Illinois General Assembly (ilga.gov), live fetch, keyless',
     attribution: 'Illinois statutes are public record.',
+    data_as_of: new Date().toISOString(),
   };
 }
+
+async function ilCompiledStatute(args: Record<string, unknown>) {
+  const chapter = String(args.chapter ?? '').trim().replace(/[^0-9]/g, '');
+  const act = String(args.act ?? '').trim().replace(/[^0-9]/g, '');
+  const section = String(args.section ?? '').trim().replace(/\s+/g, '');
+  if (!chapter || !act || !section) {
+    return { found: false, reason: 'missing_argument',
+      message: 'chapter, act and section are all required — "720 ILCS 5/9-1" is chapter 720, act 5, section 9-1.',
+      hint: 'The citation reads <chapter> ILCS <act>/<section>.' };
+  }
+  const chapterPadded = chapter.padStart(4, '0');
+  const actPadded = act.padStart(4, '0');
+
+  const r2 = r2FromArgs(args);
+  if (r2) {
+    const local = await localLookup(r2, chapterPadded, actPadded, section);
+    if ('record' in local) return local.record;
+    if (local.actKnown) {
+      // The crawl reached this act; the section simply is not in it.
+      // Authoritative — no point retrying a live path that is currently
+      // failing with HTTP 526 for every citation regardless of validity.
+      return {
+        found: false, reason: 'section_not_found', chapter, act, section,
+        message: `No section ${section} in ${chapter} ILCS ${act} (checked against a pre-fetched text of this act).`,
+        hint: 'Section numbers are not contiguous — repealed and renumbered sections are normal. Double check the section against a table of contents if unsure.',
+        data_as_of: new Date().toISOString(),
+      };
+    }
+  }
+  // Nothing pre-fetched for this chapter/act yet — try live rather than
+  // reporting section_not_found on the strength of an incomplete corpus.
+  return liveLookup(chapter, act, section);
+}
+
+async function ilStatuteSearch(args: Record<string, unknown>) {
+  const q = String(args.query ?? '').trim();
+  if (!q) {
+    return { found: false, reason: 'empty_query',
+      message: 'il_statute_search needs a query — search by topic, e.g. "currency exchange license fee".',
+      hint: 'To look up a known citation use il_compiled_statute instead.' };
+  }
+  const limit = Math.min(25, Math.max(1, Number(args.limit) || 10));
+  const ns = args._searchShards as DurableObjectNamespace | undefined;
+  const r2 = r2FromArgs(args);
+  if (!ns || !r2) {
+    return { found: false, reason: 'search_unavailable',
+      message: 'Topic search runs through Pipeworx\'s full-text index and is not available in a standalone install of this pack.',
+      hint: 'il_compiled_statute (citation lookup) still works standalone.' };
+  }
+
+  // Over-fetch past `limit`: a rowid the index no longer resolves (a
+  // superseded ingest run, or a future re-crawl that drops a repealed
+  // section) is filtered out below, and asking the shard for exactly `limit`
+  // rows would let unresolvable ones crowd out real ones instead of just
+  // being skipped. Same reasoning as the case-law search's per-shard
+  // over-fetch (shared/src/caselaw-search.ts).
+  const fetchLimit = Math.min(100, Math.max(limit * 3, 30));
+  const stub = ns.get(ns.idFromName('il-statutes'));
+  const res = await stub.fetch('https://shard/query', {
+    method: 'POST',
+    body: JSON.stringify({ q, limit: fetchLimit }),
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) {
+    return { found: false, reason: 'index_unreachable',
+      message: 'The Illinois statute search index did not answer. This is an infrastructure failure, not an absence of matching sections.' };
+  }
+  const out = (await res.json()) as { results?: { opinion_id: number; score: number }[] };
+  const hits = out.results ?? [];
+  if (!hits.length) {
+    return { found: false, query: q,
+      message: `No section matched "${q}" in the Illinois statute index.`,
+      hint: 'Try fewer or more general words — this is a full-text match, not semantic search.' };
+  }
+
+  const index = await readJson<StatuteIndex>(r2, `${R2_PREFIX}/_index.json`);
+  const byId = new Map((index?.entries ?? []).map((e) => [e.id, e]));
+  const results = hits
+    .map((h) => {
+      const e = byId.get(h.opinion_id);
+      if (!e) return null;
+      return {
+        citation: `${e.chapter.replace(/^0+/, '') || '0'} ILCS ${e.act.replace(/^0+/, '') || '0'}/${e.section}`,
+        chapter: e.chapter.replace(/^0+/, '') || '0',
+        act: e.act.replace(/^0+/, '') || '0',
+        section: e.section,
+        heading: e.heading,
+        score: h.score,
+      };
+    })
+    .filter((r): r is NonNullable<typeof r> => r !== null)
+    .slice(0, limit);
+
+  return {
+    found: results.length > 0,
+    query: q,
+    count: results.length,
+    results,
+    data_as_of: index?.ingested_at ?? null,
+    source: 'Illinois Compiled Statutes full-text search (Illinois General Assembly)',
+    hint: 'Call il_compiled_statute with the chapter/act/section from a result to get its full text.',
+  };
+}
+
+async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  if (name === 'il_compiled_statute') return ilCompiledStatute(args);
+  if (name === 'il_statute_search') return ilStatuteSearch(args);
+  throw new Error(`Unknown tool: ${name}`);
+}
+
 export default { tools, callTool, meter: { credits: 1 } } satisfies McpToolExport;
