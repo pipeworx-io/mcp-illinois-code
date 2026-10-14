@@ -25,6 +25,140 @@ interface McpToolExport {
 }
 
 /**
+ * Shared full-text-search helpers for every caller of the FTS5 case/statute
+ * search shard (workers/gateway/src/search-shard.ts, `op match ?`).
+ *
+ * THE BUG THIS FIXES (fleet #3070). Several packs sent the caller's raw text
+ * straight into FTS5's MATCH operator. A comma, a '?', or an AND/OR/NOT/NEAR
+ * in the question is FTS5 syntax, so the shard throws a SQLite error — and
+ * the pack reported that as `index_unreachable`, an infrastructure failure,
+ * when the real problem was punctuation in a plain-language question. Even
+ * once the syntax is sanitized, ANDing every word of a whole sentence
+ * ("what does X require") returns zero hits, because no statute section
+ * contains the literal word "what" — a silent, wrong "no match" for what is
+ * actually a query-shape problem, not an absence of an answer.
+ *
+ * Two packs independently built the identical fix — illinois-code
+ * (bdc38b2c2) and france-legi's core.ts — before this existed. Lifted here so
+ * every other caller of the shard (north-carolina-code, indiana-code,
+ * wyoming-code, the court-listener case-law fan-out in caselaw-search.ts, and
+ * any future statute pack) gets it for free instead of re-deriving it a
+ * third, fourth, fifth time.
+ */
+
+type FtsMode = 'all' | 'any';
+
+/**
+ * Caller text -> a safe FTS5 MATCH expression. Every word (or quoted phrase)
+ * is re-quoted as an FTS5 string literal, so FTS5 operators (AND/OR/NOT/
+ * NEAR), column filters, and stray punctuation in a plain-language question
+ * — commas, question marks, the very things a real caller's sentence is full
+ * of — cannot change the query's meaning or throw a syntax error. Non-letter,
+ * non-digit characters are simply dropped by the `\p{L}\p{N}` match, which is
+ * what turns "bond, and license" (a syntax error against `op match ?`) into
+ * a clean three-term query.
+ *
+ * `mode: 'all'` ANDs every term (precise, for a short deliberate query);
+ * `mode: 'any'` ORs them (a relaxed retry for a whole sentence — see
+ * `shardSearch` below, which is the fallback policy this exists to support).
+ *
+ * `extraTerm`, when given, is ANDed on as its own already-resolved literal
+ * (e.g. a jurisdiction/code token every hit must also carry). Resolving a
+ * caller-facing id into that literal — france-legi's `codeToken` — is the
+ * caller's job, not this function's; this only assembles the final MATCH
+ * string.
+ *
+ * Returns null when the text has no searchable words at all (e.g. "???").
+ */
+function ftsQuery(text: string, mode: FtsMode, extraTerm?: string | null): string | null {
+  const parts: string[] = [];
+  const re = /"([^"]+)"|([\p{L}\p{N}]+)/gu;
+  for (const m of text.matchAll(re)) {
+    const raw = m[1] ?? m[2];
+    const words = raw.match(/[\p{L}\p{N}]+/gu);
+    if (!words?.length) continue;
+    parts.push(`"${words.join(' ')}"`);
+  }
+  if (!parts.length) return null;
+  const body = parts.length === 1 ? parts[0] : mode === 'all' ? parts.join(' AND ') : `(${parts.join(' OR ')})`;
+  return extraTerm ? `${body} AND "${extraTerm}"` : body;
+}
+
+interface FtsHit {
+  opinion_id: number;
+  score: number;
+}
+
+interface FtsShardResult {
+  hits: FtsHit[];
+  /** Which query actually produced `hits`. Null only when the text had no
+   *  searchable words at all (`ftsQuery` returned null) and the shard was
+   *  never called. */
+  mode: FtsMode | null;
+  /** False only on a genuine shard/transport failure — non-2xx, a network
+   *  error, or a body that doesn't parse. That is a real infrastructure
+   *  problem and callers MUST report it as one (e.g. `index_unreachable`).
+   *  A legitimate zero-hit search still reports `ok: true` with `hits: []`
+   *  — callers MUST NOT collapse that distinction (silent-zero-policy). */
+  ok: boolean;
+}
+
+interface ShardStub {
+  fetch(url: string, init: RequestInit): Promise<Response>;
+}
+
+/**
+ * Query ONE shard stub with the ALL->ANY fallback: try an ALL-words match
+ * first (the precise read of a short, deliberate query — "currency exchange
+ * license fee"), and only retry with an OR-ranked ANY-word match when the
+ * query has more than one word and the ALL attempt came back empty. A long
+ * plain-language question ANDs every one of its words, including stopwords
+ * like "what" or "does" that statute/opinion text is unlikely to contain
+ * verbatim — that AND-of-a-sentence zero is not evidence the answer is
+ * absent, it's the ALL mode being too strict for a sentence shaped input.
+ * bm25's own idf weighting discounts a word that appears in nearly every
+ * document, so the ANY retry needs no separate stopword list (same reasoning
+ * search-shard.ts's own "NO STOPWORD LIST" note gives for not stripping
+ * function words from the index itself).
+ */
+async function shardSearch(
+  stub: ShardStub,
+  text: string,
+  limit: number,
+  extraTerm?: string | null,
+): Promise<FtsShardResult> {
+  const runQuery = async (matchQuery: string): Promise<FtsHit[]> => {
+    const res = await stub.fetch('https://shard/query', {
+      method: 'POST',
+      body: JSON.stringify({ q: matchQuery, limit }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) throw new Error(`shard_http_${res.status}`);
+    const out = (await res.json()) as { results?: FtsHit[] };
+    return out.results ?? [];
+  };
+
+  const allQuery = ftsQuery(text, 'all', extraTerm);
+  if (!allQuery) return { hits: [], mode: null, ok: true };
+
+  try {
+    let hits = await runQuery(allQuery);
+    let mode: FtsMode = 'all';
+    if (!hits.length && /\s/.test(text)) {
+      const anyQuery = ftsQuery(text, 'any', extraTerm);
+      if (anyQuery) {
+        hits = await runQuery(anyQuery);
+        mode = 'any';
+      }
+    }
+    return { hits, mode, ok: true };
+  } catch {
+    return { hits: [], mode: null, ok: false };
+  }
+}
+
+
+/**
  * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
  * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
@@ -1036,6 +1170,20 @@ async function ilCompiledStatute(args: Record<string, unknown>) {
   return liveLookup(chapter, act, section);
 }
 
+/**
+ * Pull an ILCS citation out of free text, if the caller named one —
+ * "205 ILCS 405" (act-level) or "205 ILCS 405/14" (section-level). Demand
+ * data showed callers naming a specific section that does not exist in the
+ * act; this is what lets that case be answered authoritatively (real
+ * sections, named) instead of falling through to a full-text search that
+ * would never surface a citation the act simply does not contain.
+ */
+export function extractCitation(text: string): { chapter: string; act: string; section: string | null } | null {
+  const m = /(\d{1,4})\s*ILCS\s*(\d{1,4})(?:\s*\/\s*([0-9][\w.-]{0,12}))?/i.exec(text);
+  if (!m) return null;
+  return { chapter: m[1], act: m[2], section: m[3] ?? null };
+}
+
 async function ilStatuteSearch(args: Record<string, unknown>) {
   const q = String(args.query ?? '').trim();
   if (!q) {
@@ -1052,6 +1200,38 @@ async function ilStatuteSearch(args: Record<string, unknown>) {
       hint: 'il_compiled_statute (citation lookup) still works standalone.' };
   }
 
+  // A caller who named a SPECIFIC section ("205 ILCS 405/999") gets an
+  // authoritative answer from the pre-fetched act bundle rather than a
+  // full-text search that cannot tell "no such section" from "search found
+  // nothing" — same semantics as ilCompiledStatute's actKnown branch: if the
+  // crawl reached this act at all, "no such section" is a fact about
+  // Illinois law, worth stating loudly with the real sections, not a reason
+  // to fall through to ranked search.
+  const cite = extractCitation(q);
+  if (cite?.section) {
+    const chapterPadded = cite.chapter.padStart(4, '0');
+    const actPadded = cite.act.padStart(4, '0');
+    const bundle = await readJson<LocalBundle>(r2, `${R2_PREFIX}/${chapterPadded}.json`);
+    const actBundle = bundle?.acts.find((a) => a.act === actPadded);
+    if (actBundle) {
+      const hit = actBundle.sections.find((s) => s.section === cite.section);
+      if (!hit) {
+        const realSections = actBundle.sections.map((s) => s.section);
+        return {
+          found: false, reason: 'section_not_found',
+          query: q, chapter: cite.chapter, act: cite.act, section: cite.section,
+          message: `No section ${cite.section} in ${cite.chapter} ILCS ${cite.act} (checked against a pre-fetched text of this act). The act has ${realSections.length} sections.`,
+          hint: 'Section numbers are not contiguous — repealed and renumbered sections are normal.',
+          real_sections: realSections.slice(0, 40),
+          data_as_of: bundle!.ingested_at,
+        };
+      }
+      // The exact section exists — fall through to ranked search below so the
+      // caller's other words (the actual question) still get an answer rather
+      // than just a citation echo.
+    }
+  }
+
   // Over-fetch past `limit`: a rowid the index no longer resolves (a
   // superseded ingest run, or a future re-crawl that drops a repealed
   // section) is filtered out below, and asking the shard for exactly `limit`
@@ -1060,17 +1240,26 @@ async function ilStatuteSearch(args: Record<string, unknown>) {
   // over-fetch (shared/src/caselaw-search.ts).
   const fetchLimit = Math.min(100, Math.max(limit * 3, 30));
   const stub = ns.get(ns.idFromName('il-statutes'));
-  const res = await stub.fetch('https://shard/query', {
-    method: 'POST',
-    body: JSON.stringify({ q, limit: fetchLimit }),
-    headers: { 'Content-Type': 'application/json' },
-  });
-  if (!res.ok) {
+
+  // shardSearch (shared, fleet #3070) does the ALL->ANY fallback this used to
+  // inline: ALL-words first (the precise read of a short, deliberate query
+  // like "currency exchange license fee"), and only a relaxed OR retry when
+  // the query has more than one word and the ALL attempt came back empty — a
+  // long sentence ANDs every one of its words, including "what", "does" and
+  // "impose", and no statute section contains the literal word "what", so
+  // that zero is not evidence of an absent answer. No separate stopword list
+  // is needed for the OR retry: bm25's own idf term weighting already
+  // discounts a word that appears in nearly every section (same reasoning
+  // search-shard.ts's "NO STOPWORD LIST" note gives for not stripping
+  // function words from the index itself).
+  const sr = await shardSearch(stub, q, fetchLimit);
+  if (!sr.ok) {
     return { found: false, reason: 'index_unreachable',
       message: 'The Illinois statute search index did not answer. This is an infrastructure failure, not an absence of matching sections.' };
   }
-  const out = (await res.json()) as { results?: { opinion_id: number; score: number }[] };
-  const hits = out.results ?? [];
+  const mode: 'all' | 'any' = sr.mode === 'any' ? 'any' : 'all';
+  const hits = sr.hits;
+
   if (!hits.length) {
     return { found: false, query: q,
       message: `No section matched "${q}" in the Illinois statute index.`,
@@ -1098,6 +1287,7 @@ async function ilStatuteSearch(args: Record<string, unknown>) {
   return {
     found: results.length > 0,
     query: q,
+    match: mode === 'all' ? 'all_words' : 'any_word',
     count: results.length,
     results,
     data_as_of: index?.ingested_at ?? null,
