@@ -1050,26 +1050,29 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'il_compiled_statute',
     description:
-      'Get the FULL TEXT of a section of the Illinois Compiled Statutes — Illinois state law — by citation. "720 ILCS 5/9-1" is first degree murder; "625 ILCS 5/11-501" is DUI. Returns the statutory text with a data_as_of timestamp. Keyless. Use for "what does 720 ILCS 5/9-1 say" or to check an Illinois statute a case relies on.',
+      'Get the FULL TEXT of a section of the Illinois Compiled Statutes — Illinois state law — by citation. "720 ILCS 5/9-1" is first degree murder; "625 ILCS 5/11-501" is DUI. Pass the full citation as `citation` ("225 ILCS 155/30") or split it into `chapter`/`act`/`section`. Returns the statutory text with a data_as_of timestamp. Keyless. Use for "what does 720 ILCS 5/9-1 say" or to check an Illinois statute a case relies on.',
     inputSchema: {
       type: 'object',
       properties: {
-        chapter: { type: 'string', description: 'ILCS chapter, e.g. "720" (criminal offenses), "625" (vehicles), "750" (families).' },
-        act: { type: 'string', description: 'Act number within the chapter — the part after ILCS and before the slash, e.g. "5".' },
-        section: { type: 'string', description: 'Section as cited, e.g. "9-1" or "11-501".' },
+        citation: { type: 'string', description: 'The full citation in one string, e.g. "225 ILCS 155/30". Alternative to chapter/act/section — either works.' },
+        chapter: { type: 'string', description: 'ILCS chapter, e.g. "720" (criminal offenses), "625" (vehicles), "750" (families). Omit if passing `citation`.' },
+        act: { type: 'string', description: 'Act number within the chapter — the part after ILCS and before the slash, e.g. "5". Omit if passing `citation`.' },
+        section: { type: 'string', description: 'Section as cited, e.g. "9-1" or "11-501". Omit if passing `citation`.' },
       },
-      required: ['chapter', 'act', 'section'],
+      anyOf: [{ required: ['citation'] }, { required: ['chapter', 'act', 'section'] }],
     },
   },
   {
     name: 'il_statute_search',
     description:
-      'Search Illinois Compiled Statutes BY TOPIC or keyword rather than citation — "currency exchange license fee", "concealed carry reciprocity", "landlord retaliation". Returns ranked sections with their citations; use il_compiled_statute afterward for the full text of one. Full-text search, so it answers questions no citation lookup can. Keyless.',
+      'Search Illinois Compiled Statutes BY TOPIC or keyword rather than citation — "currency exchange license fee", "concealed carry reciprocity", "landlord retaliation". Returns ranked sections with their citations; use il_compiled_statute afterward for the full text of one. Pass `chapter` + `act` (e.g. "225" + "155" for 225 ILCS 155) to scope the search to one act\'s own sections instead of ranking across all ~72,000 — use this when you already know which act the answer is in, so a term that is common across many acts still finds the right section. Full-text search, so it answers questions no citation lookup can. Keyless.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Topic or keywords, e.g. "currency exchange license fee".' },
+        query: { type: 'string', description: 'Topic or keywords, e.g. "currency exchange license fee". Can also name an act directly, e.g. "225 ILCS 155 civil penalty".' },
         limit: { type: 'number', description: 'Max results, default 10, max 25.' },
+        chapter: { type: 'string', description: 'Optional: ILCS chapter to scope the search to one act (pair with `act`), e.g. "225".' },
+        act: { type: 'string', description: 'Optional: act number within `chapter` to scope the search, e.g. "155" for 225 ILCS 155. Only that act\'s sections are searched.' },
       },
       required: ['query'],
     },
@@ -1085,7 +1088,7 @@ const tools: McpToolExport['tools'] = [
  * against ilga.gov would just reproduce the same HTTP 526 for no benefit.
  */
 async function localLookup(
-  r2: R2Like, chapter: string, act: string, section: string,
+  r2: R2Like, chapter: string, act: string, section: string, displayChapter: string, displayAct: string,
 ): Promise<{ record: Record<string, unknown> } | { actKnown: true } | { actKnown: false }> {
   const bundle = await readJson<LocalBundle>(r2, `${R2_PREFIX}/${chapter}.json`);
   const actBundle = bundle?.acts.find((a) => a.act === act);
@@ -1094,8 +1097,11 @@ async function localLookup(
   if (!hit) return { actKnown: true };
   return {
     record: {
-      citation: `${chapter} ILCS ${act}/${section}`,
-      chapter, act, section,
+      // Display with the chapter/act as the caller wrote them, not the
+      // zero-padded form used to key the R2 bundle — "0225 ILCS 0155/30" is
+      // not a citation anyone writes or would recognize as resolving exactly.
+      citation: `${displayChapter} ILCS ${displayAct}/${section}`,
+      chapter: displayChapter, act: displayAct, section,
       heading: hit.heading,
       text: hit.text, text_chars: hit.text.length,
       url: hit.url,
@@ -1138,12 +1144,23 @@ async function liveLookup(chapter: string, act: string, section: string) {
 }
 
 async function ilCompiledStatute(args: Record<string, unknown>) {
-  const chapter = String(args.chapter ?? '').trim().replace(/[^0-9]/g, '');
-  const act = String(args.act ?? '').trim().replace(/[^0-9]/g, '');
-  const section = String(args.section ?? '').trim().replace(/\s+/g, '');
+  let chapter = String(args.chapter ?? '').trim().replace(/[^0-9]/g, '');
+  let act = String(args.act ?? '').trim().replace(/[^0-9]/g, '');
+  let section = String(args.section ?? '').trim().replace(/\s+/g, '');
+
+  // A direct citation string ("225 ILCS 155/30") resolves exactly, same as
+  // passing chapter/act/section separately — the caller should not have to
+  // split a citation it already has in hand.
+  if ((!chapter || !act || !section) && typeof args.citation === 'string' && args.citation.trim()) {
+    const cite = extractCitation(args.citation);
+    if (cite?.section) {
+      chapter = cite.chapter; act = cite.act; section = cite.section;
+    }
+  }
+
   if (!chapter || !act || !section) {
     return { found: false, reason: 'missing_argument',
-      message: 'chapter, act and section are all required — "720 ILCS 5/9-1" is chapter 720, act 5, section 9-1.',
+      message: 'Pass a full citation ("225 ILCS 155/30") as `citation`, or chapter, act and section separately — "720 ILCS 5/9-1" is chapter 720, act 5, section 9-1.',
       hint: 'The citation reads <chapter> ILCS <act>/<section>.' };
   }
   const chapterPadded = chapter.padStart(4, '0');
@@ -1151,7 +1168,7 @@ async function ilCompiledStatute(args: Record<string, unknown>) {
 
   const r2 = r2FromArgs(args);
   if (r2) {
-    const local = await localLookup(r2, chapterPadded, actPadded, section);
+    const local = await localLookup(r2, chapterPadded, actPadded, section, chapter, act);
     if ('record' in local) return local.record;
     if (local.actKnown) {
       // The crawl reached this act; the section simply is not in it.
@@ -1184,6 +1201,103 @@ export function extractCitation(text: string): { chapter: string; act: string; s
   return { chapter: m[1], act: m[2], section: m[3] ?? null };
 }
 
+/**
+ * Search WITHIN one act's own sections instead of ranking across the whole
+ * ~72,000-section corpus. THE BUG THIS FIXES: a topic search naming an act
+ * by name ("Wellness and Oversight for Psychological Resources Act civil
+ * penalty") ranks every act's sections against every word, so a generic
+ * term like "civil penalty" surfaces a DIFFERENT act's penalty section
+ * ahead of the one actually asked for, and the real section never appears
+ * in the top results at all. Scoping to one act first means there is
+ * nothing else to outrank it with — the act bundle already in R2 for
+ * il_compiled_statute's citation lookups is reused here with no re-bake.
+ *
+ * `exactSection`, when the caller named a specific section ("225 ILCS
+ * 155/30"), short-circuits straight to it (or an authoritative
+ * section_not_found) — same reasoning as ilCompiledStatute's actKnown
+ * branch: a crawled act's missing section is a fact about Illinois law,
+ * not a search miss.
+ */
+async function actScopedSearch(
+  r2: R2Like, chapter: string, act: string, query: string, limit: number, exactSection: string | null,
+) {
+  const chapterPadded = chapter.padStart(4, '0');
+  const actPadded = act.padStart(4, '0');
+  const bundle = await readJson<LocalBundle>(r2, `${R2_PREFIX}/${chapterPadded}.json`);
+  const actBundle = bundle?.acts.find((a) => a.act === actPadded);
+  if (!actBundle) {
+    return { found: false, reason: 'act_not_found', query, chapter, act,
+      message: `No pre-fetched text for ${chapter} ILCS ${act}. The act may not exist, or has not been crawled yet.`,
+      hint: 'Check the chapter and act numbers — the act number is the part between ILCS and the slash.' };
+  }
+
+  if (exactSection) {
+    const hit = actBundle.sections.find((s) => s.section === exactSection);
+    if (hit) {
+      return {
+        found: true, query, chapter, act,
+        match: 'exact_citation', count: 1,
+        results: [{
+          citation: `${chapter} ILCS ${act}/${exactSection}`,
+          chapter, act, section: exactSection, heading: hit.heading, score: 0,
+        }],
+        data_as_of: bundle!.ingested_at,
+        source: 'Illinois Compiled Statutes (Illinois General Assembly), pre-fetched text, keyless',
+        hint: 'Call il_compiled_statute with this chapter/act/section for the full text.',
+      };
+    }
+    const realSections = actBundle.sections.map((s) => s.section);
+    return {
+      found: false, reason: 'section_not_found',
+      query, chapter, act, section: exactSection,
+      message: `No section ${exactSection} in ${chapter} ILCS ${act} (checked against a pre-fetched text of this act). The act has ${realSections.length} sections.`,
+      hint: 'Section numbers are not contiguous — repealed and renumbered sections are normal.',
+      real_sections: realSections.slice(0, 40),
+      data_as_of: bundle!.ingested_at,
+    };
+  }
+
+  // Rank the act's own sections by term overlap. One act rarely runs past a
+  // few dozen sections, so a plain scored term match is exact and needs no
+  // round trip to the cross-act FTS shard.
+  const terms = Array.from(new Set((query.match(/[\p{L}\p{N}]+/gu) ?? []).map((w) => w.toLowerCase())))
+    .filter((w) => w.length > 1);
+  const scored = actBundle.sections
+    .map((s) => {
+      const headingLower = (s.heading ?? '').toLowerCase();
+      const hay = `${headingLower} ${s.text.toLowerCase()}`;
+      let score = 0;
+      for (const t of terms) {
+        const re = new RegExp(`\\b${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
+        const count = (hay.match(re) ?? []).length;
+        if (count > 0) score += (headingLower.includes(t) ? 3 : 1) * count;
+      }
+      return { s, score };
+    })
+    .filter((r) => r.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  if (!scored.length) {
+    return { found: false, query, chapter, act,
+      message: `No section in ${chapter} ILCS ${act} matched "${query}".`,
+      hint: 'Try fewer or more general words, or drop the act scope (chapter/act) to search all chapters.',
+      data_as_of: bundle!.ingested_at };
+  }
+
+  return {
+    found: true, query, chapter, act,
+    match: 'act_scoped', count: scored.length,
+    results: scored.map(({ s, score }) => ({
+      citation: `${chapter} ILCS ${act}/${s.section}`,
+      chapter, act, section: s.section, heading: s.heading, score,
+    })),
+    data_as_of: bundle!.ingested_at,
+    source: 'Illinois Compiled Statutes (Illinois General Assembly), pre-fetched text, keyless',
+    hint: 'Call il_compiled_statute with the chapter/act/section from a result to get its full text.',
+  };
+}
+
 async function ilStatuteSearch(args: Record<string, unknown>) {
   const q = String(args.query ?? '').trim();
   if (!q) {
@@ -1192,21 +1306,51 @@ async function ilStatuteSearch(args: Record<string, unknown>) {
       hint: 'To look up a known citation use il_compiled_statute instead.' };
   }
   const limit = Math.min(25, Math.max(1, Number(args.limit) || 10));
-  const ns = args._searchShards as DurableObjectNamespace | undefined;
   const r2 = r2FromArgs(args);
+
+  // Act scope: EXPLICIT chapter+act params only — this is additive, a
+  // caller who already knows the act gets an exact, narrow search. It is
+  // deliberately not inferred from an act-only citation embedded in the
+  // query text (e.g. "205 ILCS 405" with no section): that text is already
+  // handled below by the broader cross-act search, and il_statute_search's
+  // own test suite pins that behaviour (an act name/number mentioned in a
+  // plain-language question still runs the full ranked search, since the
+  // caller may not actually mean to scope to just that act).
+  const scopeChapter = String(args.chapter ?? '').trim().replace(/[^0-9]/g, '');
+  const scopeAct = String(args.act ?? '').trim().replace(/[^0-9]/g, '');
+
+  if (scopeChapter && scopeAct) {
+    if (!r2) {
+      return { found: false, reason: 'search_unavailable',
+        message: 'Act-scoped search reads the pre-fetched act text and is not available in a standalone install of this pack.',
+        hint: 'il_compiled_statute (citation lookup) still works standalone.' };
+    }
+    // A caller who ALSO named an exact section in the query text while
+    // scoping to its act ("civil penalty" with chapter=225, act=155, where
+    // the query happens to contain "225 ILCS 155/30") still gets the
+    // authoritative exact-section answer rather than a ranked one.
+    const citeInScope = extractCitation(q);
+    const sameAct = citeInScope
+      && citeInScope.chapter.padStart(4, '0') === scopeChapter.padStart(4, '0')
+      && citeInScope.act.padStart(4, '0') === scopeAct.padStart(4, '0');
+    const exactSection = sameAct ? citeInScope!.section : null;
+    return actScopedSearch(r2, scopeChapter, scopeAct, q, limit, exactSection);
+  }
+
+  const ns = args._searchShards as DurableObjectNamespace | undefined;
   if (!ns || !r2) {
     return { found: false, reason: 'search_unavailable',
       message: 'Topic search runs through Pipeworx\'s full-text index and is not available in a standalone install of this pack.',
       hint: 'il_compiled_statute (citation lookup) still works standalone.' };
   }
 
-  // A caller who named a SPECIFIC section ("205 ILCS 405/999") gets an
-  // authoritative answer from the pre-fetched act bundle rather than a
-  // full-text search that cannot tell "no such section" from "search found
-  // nothing" — same semantics as ilCompiledStatute's actKnown branch: if the
-  // crawl reached this act at all, "no such section" is a fact about
-  // Illinois law, worth stating loudly with the real sections, not a reason
-  // to fall through to ranked search.
+  // A caller who named a SPECIFIC section in the query text ("205 ILCS
+  // 405/999") gets an authoritative answer from the pre-fetched act bundle
+  // rather than a full-text search that cannot tell "no such section" from
+  // "search found nothing" — same semantics as ilCompiledStatute's actKnown
+  // branch: if the crawl reached this act at all, "no such section" is a
+  // fact about Illinois law, worth stating loudly with the real sections,
+  // not a reason to fall through to ranked search.
   const cite = extractCitation(q);
   if (cite?.section) {
     const chapterPadded = cite.chapter.padStart(4, '0');
