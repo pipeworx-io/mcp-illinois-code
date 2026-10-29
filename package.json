@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-illinois-code",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "Illinois Compiled Statutes — state statutes by citation, plus topic search.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-illinois-code": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "illinois-code"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-illinois-code.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/illinois-code",
   "pipeworx": {
-    "sourceHash": "v1-b929a01c8f36d3706cd74774893f9cd6a006780cdc11a6f8ace8e348ba0c28d0",
-    "sourceCommit": "24e32b525f9c0b2fd7d94b519b08abb108cc11cd"
+    "mode": "gateway",
+    "slug": "illinois-code",
+    "gatewaySlug": "illinois-code",
+    "sourceHash": "v1-7a4aea0015fb15d40600218aea3e31ee4a7bf77452ec451c75b3ec47d74d02c2",
+    "sourceCommit": "4844029e402d6bd2fe735add8abf6d46735f8ed5"
   }
 }
